@@ -1,4 +1,3 @@
-
 #### production
 NAME: 'ecog'
 DATASET:
@@ -8,7 +7,7 @@ DATASET:
   MAX_RESOLUTION_LEVEL: 7
   SELECTREGION: []
   BLOCKREGION: []
-  SUBJECT: ['NY869' ]
+  SUBJECT: ['HB02','LD20221104']
   PROD: True
   FAKE_REPROD: False
   PRE_ARTICULATE: False 
@@ -20,7 +19,7 @@ MODEL:
   WAVE_BASED : True
   DO_MEL_GUIDE : False 
   BGNOISE_FROMDATA: True
-  N_FFT : 512
+  N_FFT : 256 #Origin:512
   NOISE_DB : -50
   MAX_DB : 22.5 
   NOISE_DB_AMP : -25
@@ -113,4 +112,4 @@ TRAIN:
   LOD_2_BATCH_2GPU: [64, 64, 64,   64,   32,    16]
   LOD_2_BATCH_1GPU: [64, 64, 64,   64,   32,    16]
   BATCH_SIZE : 32
-  LEARNING_RATES: [0.0015,  0.0015,   0.0015,    0.002,     0.003,    0.003]
+  LEARNING_RATES: [0.0015,  0.001,   0.005,    0.002,     0.003,    0.003]
