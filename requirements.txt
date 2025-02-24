@@ -1,5 +1,4 @@
-numpy
-parselmouth
+praat-parselmouth
 torch==1.12.1
 torchaudio==0.12.1
 h5py==2.10.0
@@ -9,4 +8,11 @@ pandas==1.1.4
 scikit-learn==0.23.2
 scipy==1.4.1
 seaborn==0.11.1
+numpy==1.22.0
 tqdm
+timm
+yacs
+pystoi
+einops
+dareblopy
+ipykernel
