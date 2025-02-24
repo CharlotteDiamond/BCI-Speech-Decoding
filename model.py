@@ -43,7 +43,6 @@ def safe_divide(numerator, denominator, eps=1e-7):
     ).float()
     return numerator / safe_denominator
 
-
 def safe_log(x, eps=1e-5):
     """Avoid taking the log of a non-positive number."""
     # print ('type',type(x),x)
@@ -74,7 +73,11 @@ def piecewise_linear(epoch, start_decay=20, end_decay=40):
     if epoch < start_decay:
         return 1
     elif start_decay <= epoch < end_decay:
-        return 1 / (start_decay - end_decay) * epoch + 2
+        # return 1 / (start_decay - end_decay) * epoch + 2
+        ''' Hedi H. Changed
+         1 / (start_decay - end_decay) * epoch + 2 In most cases, the gradually decreasing linear function will not be reflected correctly.
+The improved code implements a function that gradually decreases linearly from 1 to 0, which conforms to the logic of the usual piecewise linear decay.'''
+        return 1 - (epoch - start_decay) / (end_decay - start_decay)
     else:
         return 0
 
@@ -83,8 +86,7 @@ def minmaxscale(data, quantile=0.9):
     if quantile is not None:
         datamax = torch.quantile(data, quantile)
         data = torch.clip(data, -10e10, datamax)
-    minv = data.min()
-    maxv = data.max()
+    minv, maxv = data.min(), data.max()
     if minv == maxv:
         return data
     else:
@@ -96,8 +98,7 @@ def minmaxscale_ref(data, data_select, quantile=0.9):
     if quantile is not None:
         datamax = torch.quantile(data_select, quantile)
         data_select = torch.clip(data_select, -10e10, datamax)
-    minv = data_select.min()
-    maxv = data_select.max()
+    minv, maxv = data_select.min(), data_select.max()
     data = torch.clip(data, -10e10, datamax)
     # print (minv,maxv,maxv - minv)
     if minv == maxv:
@@ -375,8 +376,8 @@ class Model(nn.Module):
                     n_formants=n_formants_ecog,
                     network_db=network_db,
                     causal=causal,
-                    anticausal=anticausal,
                     pre_articulate=pre_articulate,
+                    anticausal=anticausal,
                 )
         self.ghm_loss = ghm_loss
         self.stoi_loss_female = STOI_Loss(extended=False, plus=True, FFT_size=256)
@@ -486,13 +487,12 @@ class Model(nn.Module):
             )
         else:
             Lae_mtf = torch.tensor(0.0)
-
         if self.delta_time:
             loss_delta_time = (
                 (diff_dim(rec_amp, axis=2) - diff_dim(spec_amp, axis=2)).abs().mean()
             )
             if tracker is not None:
-                tracker.update(dict({"Lae_delta_time" + suffix: Lae_delta_time}))
+                tracker.update(dict({"Lae_delta_time" + suffix: loss_delta_time}))
         else:
             loss_delta_time = torch.tensor(0.0)
         if self.delta_freq:
@@ -549,6 +549,8 @@ class Model(nn.Module):
         calculate component loss with spectrogram encoded components and ECoG decoded components
         """
         if self.spec_sup:
+            # print("rec shape:", rec.shape)
+            # print("spec shape:", spec.shape)
             '''
             original and reconstructed linear spectrogram loss using function `lae`
             '''
