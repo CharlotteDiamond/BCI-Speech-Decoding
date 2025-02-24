@@ -1,16 +1,24 @@
+# 2024 Hedi H. Changed
+#
+# Add two more encoder: biLSTM. Transformer
+# ==============================================================================
+
 import os
+import math
 import torch
 import torchaudio
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.parameter import Parameter
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
 import numpy as np
 import utils.lreq as ln
 import utils.lreq_causal as ln_c
 from utils.registry import *
 from modules.Swin3D_blocks import *
-
+from modules.switchable_norm import SwitchNorm1d, SwitchNorm2d, SwitchNorm3d
 device = 'cuda' if torch.cuda.is_available() else 'cpu' 
+
 def db(x, noise=-80, slope=35, powerdb=True):
     if powerdb:
         return (
@@ -29,6 +37,8 @@ def to_db(x, noise_db=-60, max_db=35):
         max_db - noise_db
     ) * 2 - 1
 
+def db_to_amp(db_values):
+    return 10 ** (db_values / 20)
 
 def amplitude(x, noise_db=-60, max_db=35, trim_noise=False):
     if trim_noise:
@@ -39,7 +49,6 @@ def amplitude(x, noise_db=-60, max_db=35, trim_noise=False):
             return 10 ** (x_db / 10) * (x_db > noise_db).float()
     else:
         return 10 ** (((x + 1) / 2 * (max_db - noise_db) + noise_db) / 10)
-
 
 def wave2spec(
     wave,
@@ -72,7 +81,6 @@ def wave2spec(
             hop_length=int(wave_fr / spec_fr),
             power=power,
         )(wave).transpose(-2, -1)
-
 
 def mel_scale(n_mels, hz, min_octave=-31.0, max_octave=102.0, pt=True):
     if pt:
@@ -138,7 +146,6 @@ def inverse_spec_to_audio(
         hop_length=hop_length,
     )
 
-
 def h_poly_helper(tt):
     A = torch.tensor(
         [
@@ -151,11 +158,9 @@ def h_poly_helper(tt):
     )
     return torch.matmul(tt, A.transpose(0, 1))
 
-
 def h_poly(t):
     tt = torch.stack([torch.ones_like(t), t, t**2, t**3], -1)
     return h_poly_helper(tt)
-
 
 def H_poly(t):
     tt = [None for _ in range(4)]
@@ -163,7 +168,6 @@ def H_poly(t):
     for i in range(1, 4):
         tt[i] = tt[i - 1] * t * i / (i + 1)
     return h_poly_helper(tt)
-
 
 def interp(y, xs):
     y = y[0].squeeze()
@@ -460,7 +464,6 @@ class LearntFormantFilterMultiple(nn.Module):
 
 class DoubleConv(nn.Module):
     """(convolution => [norm] => LeakyReLU) * 2"""
-
     def __init__(
         self,
         in_channels,
@@ -498,7 +501,6 @@ class DoubleConv(nn.Module):
 
 class Upsample_Block(nn.Module):
     """Upscaling then double conv"""
-
     def __init__(
         self, in_channels, out_channels, bilinear=False, causal=False, anticausal=False
     ):
@@ -519,7 +521,7 @@ class Upsample_Block(nn.Module):
     def forward(self, x):
         return self.up(x)
 
-
+#Normalization layer
 class GroupNormXDim(nn.Module):
     def __init__(self, num_groups, num_channels, **kargrs):
         super(GroupNormXDim, self).__init__()
@@ -533,7 +535,6 @@ class GroupNormXDim(nn.Module):
         x = x.reshape(szs)
         x = x.permute([0, 2, 1] + list(range(3, x.ndim)))
         return x
-
 
 class BatchNormXDim(nn.Module):
     def __init__(self, num_groups, num_channels, **kargrs):
@@ -552,6 +553,70 @@ class BatchNormXDim(nn.Module):
         if x.dim == 5:
             x = self.norm3d(x)
         x = x.reshape(szs)
+        return x
+
+'''Hedi H. Changed
+Add Switchable Normalization Layer and Layer Normalization
+'''
+class SwitchableNorm(nn.Module):
+    def __init__(self, num_groups, num_channels, dim, **kargrs):
+        super(SwitchableNorm, self).__init__()
+        if dim == 2:
+            self.norm = SwitchNorm1d(num_channels, **kargrs)
+        elif dim == 4:
+            self.norm = SwitchNorm2d(num_channels, **kargrs)
+        elif dim == 5:
+            self.norm = SwitchNorm3d(num_channels, **kargrs)
+        else:
+            raise ValueError('Unsupported dimension: {}'.format(dim))
+
+    def forward(self, x):
+        if x.dim() == 3:
+            #1D
+            x = x.permute(0, 2, 1)
+            x = self.norm(x)
+            x = x.permute(0, 2, 1)
+        elif x.dim() == 4:
+            #2D
+            x = x.permute(0, 2, 3, 1)
+            x = x.contiguous().view(-1, x.size(-1))
+            x = self.norm(x)
+            x = x.view(-1, x.size(-1), x.size(1), x.size(2))
+            x = x.permute(0, 3, 1, 2)
+        elif x.dim() == 5:
+            #3D
+            x = x.permute(0, 2, 3, 4, 1)
+            szs = x.shape
+            x = x.reshape(szs[0] * szs[1], *szs[2:])
+            x = self.norm(x)
+            x = x.view(szs)
+            x = x.permute(0, 4, 1, 2, 3)
+        else:
+            raise ValueError('Unsupported dimension: {}'.format(x.dim()))
+        return x
+
+class LayerNormXDim(nn.Module):
+    def __init__(self, num_groups, num_channels, dim, **kargrs):
+        super(LayerNormXDim, self).__init__()
+        self.norm = nn.LayerNorm(num_channels, **kargrs)
+    def forward(self, x):
+        szs = x.shape
+        if x.dim() == 2:
+            x = self.norm(x)
+        elif x.dim() == 3:
+            x = x.permute(0, 2, 1)
+            x = self.norm(x)
+            x = x.permute(0, 2, 1)
+        elif x.dim() == 4:
+            x = x.permute(0, 3, 1, 2)
+            x = self.norm(x)
+            x = x.permute(0, 2, 3, 1)
+        elif x.dim() == 5:
+            x = x.permute(0, 4, 1, 2, 3)
+            x = self.norm(x)
+            x = x.permute(0, 2, 3, 4, 1)
+        else:
+            raise ValueError('Unsupported tensor dimensions: {}'.format(x.dim()))
         return x
 
 
@@ -1352,8 +1417,8 @@ class FormantEncoder(nn.Module):
         broud=True,
         power_synth=False,
         hop_length=128,
-        patient="HB02",
-        gender_patient="Female",
+        patient="LD01", # HB02
+        gender_patient="Male", # Female
         larger_capacity=False,
         unified=False,
     ):
@@ -2018,12 +2083,12 @@ formant_freq_limits_abs_noise = torch.tensor([8000.,7000.,7000.]).reshape([1,3,1
 formant_freq_limits_abs_noise_low = torch.tensor([4000.,3000.,3000.]).reshape([1,3,1]).to(device) #freq difference
 formant_bandwitdh_ratio = Parameter(torch.Tensor(1)).to(device)
 formant_bandwitdh_slop = Parameter(torch.Tensor(1)).to(device)
+
 class Speech_Para_Prediction(nn.Module):
     def __init__(self, causal, anticausal, compute_db_loudness=False, n_formants= 6,n_formants_noise=1,\
                  n_mels=32,network_db=False,input_channel=32):
         super(Speech_Para_Prediction, self).__init__()
         norm = GroupNormXDim
-        
         self.n_formants = n_formants
         self.n_mels = n_mels
         self.n_formants_noise = n_formants_noise
@@ -2040,7 +2105,6 @@ class Speech_Para_Prediction(nn.Module):
         with torch.no_grad():
             nn.init.constant_(self.formant_bandwitdh_ratio,0)
             nn.init.constant_(self.formant_bandwitdh_slop,0)
-        
         self.conv_fundementals = ln_c.Conv1d(input_channel,32,3,1,1 ,causal=causal,anticausal = anticausal)
         self.norm_fundementals = norm(32,32)
         self.f0_drop = nn.Dropout()
@@ -2072,7 +2136,6 @@ class Speech_Para_Prediction(nn.Module):
         x_fundementals = self.f0_drop(F.leaky_relu(self.norm_fundementals(self.conv_fundementals(x_common)),0.2))
         f0_hz = torch.sigmoid(self.conv_f0(x_fundementals)) * 332 + 88 # 88hz < f0 < 420 hz
         f0 = torch.clamp(mel_scale(self.n_mels,f0_hz)/(self.n_mels*1.0),min=0.0001)
-
         x_formants = F.leaky_relu(self.norm_formants(self.conv_formants(x_common)),0.2)
         formants_freqs = torch.sigmoid(self.conv_formants_freqs(x_formants))
         formants_freqs_hz = formants_freqs*(self.formant_freq_limits_abs[:,:self.n_formants]-self.formant_freq_limits_abs_low[:,:self.n_formants])+self.formant_freq_limits_abs_low[:,:self.n_formants]
@@ -2095,7 +2158,7 @@ class Speech_Para_Prediction(nn.Module):
         if self.network_db:
             formants_amplitude = torch.sigmoid(formants_amplitude_logit )    
             formants_amplitude_noise = torch.sigmoid(formants_amplitude_noise_logit )
-            amplitudes = torch.sigmoid(logits ) 
+            amplitudes = torch.sigmoid(logits) 
             amplitudes = db_to_amp(amplitudes)
             formants_amplitude_noise = db_to_amp(formants_amplitude_noise)
             formants_amplitude = db_to_amp(formants_amplitude)
@@ -2129,7 +2192,6 @@ class Speech_Para_Prediction(nn.Module):
 
 class BasicRNN(torch.nn.Module):
     """vanilla rnn"""
-
     def __init__(
         self,
         n_layers=2,
@@ -2139,11 +2201,11 @@ class BasicRNN(torch.nn.Module):
         n_input_features=256,
         n_output_features=256,
         batch_first=True,
+        pre_articulate = False, # Fixed 2024, it didn't have this parameter before but error shows
         dropout=0.5,
         use_final_linear_layer=False,
     ):
         super(BasicRNN, self).__init__()
-
         # load params
         self.n_layers = n_layers
         self.n_rnn_units = n_rnn_units
@@ -2152,6 +2214,7 @@ class BasicRNN(torch.nn.Module):
         self.n_input_features = n_input_features
         self.n_output_features = n_output_features
         self.use_final_linear_layer = use_final_linear_layer
+        self.pre_articulate = pre_articulate # Fixed 2024, it didn't have this parameter before but error shows
         self.batch_first = batch_first
 
         # define architecture
@@ -2181,7 +2244,6 @@ class BasicRNN(torch.nn.Module):
         transform_state=False,
         **kwargs,
     ):
-
         # transform states if needed
         if initial_state is not None and transform_state:
             transformed_state = self.transform_initial_state(initial_state)
@@ -2197,6 +2259,7 @@ class BasicRNN(torch.nn.Module):
                 inputs, seq_lengths, batch_first=True, enforce_sorted=False
             )
         # import pdb; pdb.set_trace()
+        #print ('basic rnn inputs',inputs.shape) ([16, 144, 225])
         output, state = self.rnn(inputs, transformed_state)
         if seq_lengths is not None:
             output, _ = torch.nn.utils.rnn.pad_packed_sequence(
@@ -2206,7 +2269,7 @@ class BasicRNN(torch.nn.Module):
         # optional linear layer and return
         if self.use_final_linear_layer:
             output = self.output_layer(output)
-        # print ('basic rnn output',output.shape)
+        #print ('basic rnn output',output.shape)
         return output
 
 
@@ -2304,7 +2367,7 @@ class ECoGMapping_Bottleneck(nn.Module):
             32, latent_channel, bilinear=True if upsample == "bilinear" else False
         )
         self.norm6 = norm(32, latent_channel)
-        self.dropout = nn.Dropout(p=0.2)
+        self.dropout = nn.Dropout(p=0.5)
         self.GR = GR
         if GR:  # gradient reversal
             self.Speaker_Classifier_GR(
@@ -2338,6 +2401,8 @@ class ECoGMapping_Bottleneck(nn.Module):
         #C*8*2*2
         x = x.max(-1)[0].max(-1)[0]
         #C*8*1*1
+        '''Hedi H. Changed
+        Use Swish activation function instead of LeakyReLU activation function
         x = self.conv5(F.leaky_relu(self.norm(x), 0.2))
         x = self.norm2(x)
         x = self.conv6(F.leaky_relu(x, 0.2))
@@ -2346,7 +2411,16 @@ class ECoGMapping_Bottleneck(nn.Module):
         x = self.conv9(F.leaky_relu(self.norm5(x), 0.2))
         #C'*128
         x_common = F.leaky_relu(self.norm6(x), 0.2)
-        # print (x_common.shape)
+        '''
+        x = self.conv5(F.silu(self.norm(x)))
+        x = self.norm2(x)
+        x = self.conv6(F.silu(x))
+        x = self.conv7(F.silu(self.norm3(x)))
+        x = self.conv8(F.silu(self.norm4(x)))
+        x = self.conv9(F.silu(self.norm5(x)))
+        x = self.dropout(x)
+        x_common = F.silu(self.norm6(x))
+        #print("x_common", x_common.shape)
         if self.GR:
             classified_Speakers = self.Speaker_Classifier_GR(x_common)
         components = self.prediction_head(x_common)
@@ -2354,13 +2428,12 @@ class ECoGMapping_Bottleneck(nn.Module):
 
 
 @ECOG_DECODER.register("ECoGMapping_RNN")
-class ECoGMappingRNN(torch.nn.Module):
+class ECoGMapping_RNN(torch.nn.Module):
     """Model used to predict motion traces and speech features from ECoG data using Transformer"""
-
     def __init__(
         self,
         n_electrodes=64,
-        n_input_features=64,
+        n_input_features=64, # Fixed 2024, it was 64 before but error shows 就应该是64，跟class是一样的数量 第一次是255，后来是64
         n_classes=64,  # latent feature dimension
         n_layers=3,
         n_rnn_units=128,
@@ -2376,17 +2449,17 @@ class ECoGMappingRNN(torch.nn.Module):
         n_formants=5,
         n_formants_noise=1,
         anticausal=False,
+        pre_articulate=False, # Fixed 2024, it didn't have this parameter before but error shows
         compute_db_loudness=False,
         GR=False,
     ):
-        super(ECoGMappingRNN, self).__init__()
-
+        super(ECoGMapping_RNN, self).__init__()
         # params
         self.n_classes = n_classes
         self.num_electrodes = n_electrodes
         self.normalize_inputs = normalize_inputs
-
-        # rnn model
+        self.pre_articulate = pre_articulate# Fixed 2024, it didn't have this parameter before but error shows
+        # RNN model
         self.base_model = BasicRNN(
             n_layers=n_layers,
             n_rnn_units=n_rnn_units,
@@ -2396,16 +2469,16 @@ class ECoGMappingRNN(torch.nn.Module):
             n_output_features=n_output_features,
             batch_first=batch_first,
             dropout=dropout,
+            pre_articulate=pre_articulate, # Fixed 2024, it didn't have this parameter before but error shows
             use_final_linear_layer=use_final_linear_layer,
         )
-
         self.relu = torch.nn.ReLU()
         latent_channel = self.n_classes
         self.motion_projection = torch.nn.Linear(
             n_rnn_units * 2 if not causal else n_rnn_units, latent_channel
         )
         norm = GroupNormXDim
-        self.dropout = nn.Dropout(p=0.2)
+        self.dropout = nn.Dropout(p=0.5)
         self.GR = GR
         if GR:  # gradient reversal
             self.Speaker_Classifier_GR(
@@ -2423,41 +2496,44 @@ class ECoGMappingRNN(torch.nn.Module):
             network_db=network_db,
             input_channel=latent_channel,
         )
-
+        self.reduce_dimension = ln_c.Linear(225, 64) # From nn to ln_c
     def forward(
         self,
         inputs,
         gender="Female",
         **kwargs,
     ):
-
         dim = inputs.shape[2]
+        #print(inputs.shape) #torch.Size([16, 144, 225])
         n_features = dim // self.num_electrodes
+        #print(n_features) #3
         if self.normalize_inputs:
             for n in range(n_features):
                 normalized_inputs = torch.nn.functional.normalize(
-                    inputs[
-                        :, :, n * self.num_electrodes : (n + 1) * self.num_electrodes
-                    ],
-                    dim=-1,
+                    inputs[:, :, n * self.num_electrodes : (n + 1) * self.num_electrodes],dim=-1,
                 )
-                inputs[
-                    :, :, n * self.num_electrodes : (n + 1) * self.num_electrodes
-                ] = normalized_inputs
-        latent_representation = self.base_model.forward(inputs)
-        print("latent_representation", latent_representation.shape)
-        x_common = self.motion_projection(self.relu(latent_representation))[
-            :, 8:-8
-        ].permute(0, 2, 1)
-        print("x_common", x_common.shape)
+                inputs[:, :, n * self.num_electrodes : (n + 1) * self.num_electrodes] = normalized_inputs
+        #print(inputs.shape)
+        #print(inputs.shape)
+        if inputs.shape[-1] == 225:
+            inputs_reduced = self.reduce_dimension(inputs)
+        else:
+            inputs_reduced = inputs 
+        #print(inputs_reduced.shape)
+        latent_representation = self.base_model.forward(inputs_reduced)
+        #print("latent_representation", latent_representation.shape) #torch.Size([16, 144, 256])
+        x_common = self.motion_projection(self.relu(latent_representation))[ :, 8:-8].permute(0, 2, 1)
+        #print("x_common", x_common.shape) #torch.Size([16, 64, 128])
+        x_common = self.dropout(x_common)
+        #print("x_common after dropout:" ,x_common.shape) #torch.Size([16, 64, 128])
         if self.GR:
             classified_Speakers = self.Speaker_Classifier_GR(x_common)
         components = self.prediction_head(x_common)
         return components if not self.GR else classified_Speakers
 
-
+'''The normalization layer of the 3D swin algorithm has been changed to the swichnormalization method'''
 @ECOG_DECODER.register("ECoGMapping_3D_SWIN")
-class ECoGMapping_3D_SWIN(nn.Module):
+class ECoGMapping_3DSWIN(nn.Module):
     def __init__(
         self,
         n_mels,
@@ -2473,7 +2549,7 @@ class ECoGMapping_3D_SWIN(nn.Module):
         network_db=False,
         GR=0,
     ):
-        super(ECoGMapping_3D_SWIN, self).__init__()
+        super(ECoGMapping_3DSWIN, self).__init__()
         self.causal = causal
         self.anticausal = anticausal
         self.n_formants = n_formants
@@ -2481,12 +2557,16 @@ class ECoGMapping_3D_SWIN(nn.Module):
         self.n_formants_noise = n_formants_noise
         self.compute_db_loudness = compute_db_loudness
         self.pre_articulate = pre_articulate
-
-        self.norm6 = nn.GroupNorm(hidden_dim, hidden_dim)
+        self.norm5 = nn.GroupNorm(hidden_dim, hidden_dim)
         self.conv_fundementals = ln_c.Conv1d(
             hidden_dim, 32, 3, 1, 1, causal=causal, anticausal=anticausal
         )
         self.norm_fundementals = nn.GroupNorm(32, 32)
+        # self.norm5 = SwitchableNorm(hidden_dim, hidden_dim, dim=1)
+        # self.conv_fundementals = ln_c.Conv1d(
+        #     hidden_dim, 32, 3, 1, 1, causal=causal, anticausal=anticausal
+        # )
+        # self.norm_fundementals = SwitchableNorm(32, 32, dim=1)
         self.f0_drop = nn.Dropout()
         self.conv_f0 = ln_c.Conv1d(32, 1, 1, 1, 0, causal=causal, anticausal=anticausal)
         self.conv_amplitudes = ln_c.Conv1d(
@@ -2510,11 +2590,11 @@ class ECoGMapping_3D_SWIN(nn.Module):
                 causal=causal,
                 anticausal=anticausal,
             )
-
         self.conv_formants = ln_c.Conv1d(
             hidden_dim, 32, 3, 1, 1, causal=causal, anticausal=anticausal
         )
         self.norm_formants = nn.GroupNorm(32, 32)
+        #self.norm_formants = SwitchableNorm(32, 32, dim=1)
         self.conv_formants_freqs = ln_c.Conv1d(
             32, n_formants, 1, 1, 0, causal=causal, anticausal=anticausal
         )
@@ -2534,18 +2614,14 @@ class ECoGMapping_3D_SWIN(nn.Module):
         self.conv_formants_amplitude_noise = ln_c.Conv1d(
             32, n_formants_noise, 1, 1, 0, causal=causal, anticausal=anticausal
         )
-
         depthss = [[2, 2, 6, 2], [2, 2, 6, 2]]
         patch_size_Ts = [2, 2]
         patch_size_Es = [(1, 1), (2, 2)]
         window_size_Ts = [4, 8, 16]
         window_size_Es = [(4, 4), (4, 4), (4, 4)]
         numclassess = [384, 384, 384]  # according to final temporal length
-
-        if causal:
-            norm = GroupNormXDim
-        else:
-            norm = GroupNormXDim
+        norm = GroupNormXDim
+        #norm = SwitchableNorm
         base_swin = 48
         self.swin_transformer = SwinTransformer3D1(
             patch_size=(2, 2, 2),
@@ -2562,23 +2638,26 @@ class ECoGMapping_3D_SWIN(nn.Module):
         self.conv6 = ln.ConvTranspose1d(
             numclassess[select_ind], 256, 3, 2, 1, transform_kernel=True
         ) 
-
         self.upconvs1 = Upsample_Block(
             256, hidden_dim, bilinear=True if upsample == "bilinear" else False
         )
         self.norms1 = norm(32, hidden_dim)
+        #self.norms1 = SwitchableNorm(32, hidden_dim, dim=1)
         self.upconvs2 = Upsample_Block(
             hidden_dim, hidden_dim, bilinear=True if upsample == "bilinear" else False
         )
         self.norms2 = norm(32, hidden_dim)
+        #self.norms2 = SwitchableNorm(32, hidden_dim, dim=1)
         self.upconvs3 = Upsample_Block(
             hidden_dim, hidden_dim, bilinear=True if upsample == "bilinear" else False
         )
         self.norms3 = norm(32, hidden_dim)
+        #self.norms3 = SwitchableNorm(32, hidden_dim, dim=1)
         self.upconvs4 = Upsample_Block(
             hidden_dim, hidden_dim, bilinear=True if upsample == "bilinear" else False
         )
         self.norms4 = norm(32, hidden_dim)
+        #self.norms4 = SwitchableNorm(32, hidden_dim, dim=1)
         self.upconv_layers = [
             self.upconvs1,
             self.upconvs2,
@@ -2593,7 +2672,6 @@ class ECoGMapping_3D_SWIN(nn.Module):
                 previous_Channels=self.n_classes,
                 Num_Speakers=2,
             )
-
         self.prediction_head = Speech_Para_Prediction(
             causal=causal,
             anticausal=anticausal,
@@ -2606,34 +2684,307 @@ class ECoGMapping_3D_SWIN(nn.Module):
         )
 
     def forward(self, ecog):
+        print("\n")
+        print("ecog.shape:",ecog.shape)
         elec_length = int(ecog[0].shape[-1] ** 0.5)
         x = ecog[:, 16:]
         x = x.reshape([-1, x.shape[1], elec_length, elec_length, 1])
+        #print("x.shape:",x.shape)
         xs = F.pad(
-            input=x, pad=(0, 0, 1, 0, 1, 0, 0, 0), mode="constant", value=0
-        ).permute(
-            0, 4, 1, 2, 3
-        )
+            input=x, 
+            pad=(0, 0, 1, 0, 1, 0, 0, 0), 
+            mode="constant", 
+            value=0
+        ).permute(0, 4, 1, 2, 3)
+        #print("xs.shape:",xs.shape)
         bs_per = x.shape[0]
+        #print(bs_per) 16
         xs = (
             self.swin_transformer(xs, region_index=None)
             .squeeze(-1)
             .squeeze(-1)
             .transpose(1, 2)
         )
-        x = self.conv6(F.leaky_relu(xs.transpose(1, 2), 0.2))
+        #print(xs.shape)  ([16, 8, 384])
 
+        # x = self.conv6(F.leaky_relu(xs.transpose(1, 2), 0.2))
+        # for i in range(self.swin_down_times - 1):
+        #     x = self.upconv_layers[i](F.leaky_relu(self.norm_layers[i](x), 0.2))
+        # x_common = F.leaky_relu(self.norm5(x), 0.2)
+
+        x = self.conv6(F.silu(xs.transpose(1, 2)))
+        #print("x",x.shape) ([16, 256, 16])
         for i in range(self.swin_down_times - 1):
-            x = self.upconv_layers[i](F.leaky_relu(self.norm_layers[i](x), 0.2))
-        x_common = F.leaky_relu(self.norm6(x), 0.2)
-        print("x_common", x_common.shape)
+            x = self.upconv_layers[i](F.silu(self.norm_layers[i](x)))
+        x_common = F.silu(self.norm5(x))
+        print("x_common", x_common.shape) #torch.Size([16，256，128])
         if self.GR:
             classified_Speakers = self.Speaker_Classifier_GR(x_common)
         components = self.prediction_head(x_common)
         return components if not self.GR else classified_Speakers
 
+@ECOG_DECODER.register("ECoGMapping_BiLSTM")
+class ECoGMapping_BiLSTM(nn.Module):
+    def __init__(
+        self,
+        n_electrodes=64,
+        n_input_features=256,
+        n_classes=64,  # latent feature dimension
+        n_layers=3,
+        n_blstm_units=128,
+        max_sequence_length=500,
+        n_output_features=256,
+        batch_first=True,
+        dropout=0.5,
+        use_final_linear_layer=True,
+        n_mels=32,
+        network_db=False,
+        causal=False,
+        n_formants=5,
+        n_formants_noise=1,
+        latent_channel =32,
+        anticausal=False,
+        pre_articulate=False,
+        compute_db_loudness=False,
+        bidirectional = True,
+        GR=False,
+        target_size=(144, 225), 
+    ):
+        super(ECoGMapping_BiLSTM, self).__init__()
+        self.n_classes = n_classes
+        self.num_electrodes = n_electrodes
+        self.n_input_features = n_input_features
+        self.n_layers = n_layers
+        self.n_blstm_units = n_blstm_units
+        self.max_sequence_length = max_sequence_length
+        self.n_output_features = n_output_features
+        self.batch_first = batch_first
+        self.dropout = dropout
+        self.use_final_linear_layer = use_final_linear_layer
+        self.n_mels = n_mels
+        self.network_db = network_db
+        self.causal = causal
+        self.n_formants = n_formants
+        self.n_formants_noise = n_formants_noise
+        self.anticausal = anticausal
+        self.compute_db_loudness = compute_db_loudness
+        self.pre_articulate = pre_articulate
+        self.bidirectional = bidirectional
+        self.latent_channel = n_output_features
+        self.GR = GR
+        self.target_size = target_size
+        self.normalize_input_size = NormalizeInputSize(target_size=target_size)
+        norm = GroupNormXDim
+        self.norm1 = nn.GroupNorm(n_input_features, n_input_features)
+        self.motion_projection = ln_c.Linear(
+            n_blstm_units if not causal else n_blstm_units/2, latent_channel
+        ) # From nn to ln_c
+        if GR: 
+            self.Speaker_Classifier_GR(
+                Channels=[self.n_classes],
+                previous_Channels=self.n_classes,
+                Num_Speakers=2,
+            )
+        self.bilstm = BasicRNN(
+            n_layers=n_layers,
+            n_rnn_units=n_blstm_units,
+            max_sequence_length=max_sequence_length,
+            bidirectional=True, #BiLSTM
+            n_input_features=n_input_features,
+            n_output_features=n_output_features,
+            batch_first=batch_first,
+            dropout=dropout,
+            pre_articulate=pre_articulate, 
+            use_final_linear_layer=use_final_linear_layer,
+        )
+        self.relu = torch.nn.ReLU()
+        if use_final_linear_layer:
+            self.fc = nn.Linear(n_blstm_units * 2, n_output_features)  # two parameters not three
+        self.linear = ln_c.Linear(256, 128) # From nn to ln_c
+        self.dropout_layer = nn.Dropout(p=dropout)
+        self.prediction_head = Speech_Para_Prediction(
+            causal=causal,
+            anticausal=anticausal,
+            compute_db_loudness=compute_db_loudness,
+            n_formants=n_formants,
+            n_formants_noise=n_formants_noise,
+            n_mels=n_mels,
+            network_db=network_db,
+            input_channel=n_output_features,
+        )
+        self.reduce_dimension = ln_c.Linear(225, 256)# From nn to ln_c
+        self.expand_dimension = ln_c.Linear(64, 256)# From nn to ln_c
+        self.conv1 = ln_c.ConvTranspose1d(
+            32, 
+            256,
+            1,
+            1,
+            0,
+            transform_kernel=True,
+            causal=causal,
+            anticausal=anticausal) 
+    def forward(self, ecog): 
+        ecog = self.normalize_input_size(ecog)
+        if ecog.shape[-1] == 225:
+            ecog_reduced = self.reduce_dimension(ecog)
+        else:
+            ecog_reduced = ecog 
+        latent_representation = self.bilstm.forward(ecog_reduced)
+        #print("latent_representation", latent_representation.shape) #torch.Size([16, 144, 256])
+        x = self.linear(latent_representation)
+        #print(x.shape) #torch.Size([16, 144, 128])
+        x_common = self.motion_projection(self.relu(x))[ :, 8:-8].permute(0, 2, 1)
+        #print("x_common", x_common.shape) #torch.Size([16, 32, 128])
+        x_common = F.silu(self.conv1(self.dropout_layer(x_common))[:,:,:128]) #torch.Size([16,256,128])
+        x_common = self.norm1(x_common)
+        if self.GR:
+            classified_Speakers = self.Speaker_Classifier_GR(x_common)
+        components = self.prediction_head(x_common)
+        return components if not self.GR else classified_Speakers
+    
+@ECOG_DECODER.register("ECoGMapping_Transformer")
+class ECoGMapping_Transformer(nn.Module):
+    def __init__(
+        self,
+        n_mels,
+        n_electrodes=64,
+        n_input_features=64,
+        n_classes=64,
+        n_layers=3,
+        d_model=256,  # Transformer model dimension
+        n_heads=8,
+        d_ff=1024,  # Feedforward dimension
+        max_sequence_length=500,
+        n_output_features = 256,
+        dropout=0.5,
+        pre_articulate=False,
+        GR=False,
+        norm_layer=nn.LayerNorm,
+        causal=False,
+        n_formants=5,
+        n_formants_noise=1,
+        anticausal=False,
+        compute_db_loudness=False,
+        network_db=False,
+        target_size=(144, 225), 
+    ):
+        super(ECoGMapping_Transformer, self).__init__()
+        self.n_electrodes = n_electrodes
+        self.n_input_features = n_input_features
+        self.n_classes = n_classes
+        self.n_layers = n_layers
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_ff = d_ff
+        self.max_sequence_length = max_sequence_length
+        self.dropout = dropout
+        self.pre_articulate = pre_articulate
+        self.n_output_features = n_output_features
+        self.GR = GR
+        self.network_db = network_db
+        self.target_size = target_size
+        self.normalize_input_size = NormalizeInputSize(target_size=target_size)
+        self.embedding = ln_c.Linear(225, d_model) 
+        self.pos_encoder = PositionalEncoding(d_model, max_sequence_length, dropout)
+        self.multihead_attn = nn.MultiheadAttention(
+            embed_dim=d_model, 
+            num_heads=n_heads, 
+            dropout=dropout, 
+            batch_first=True
+            )
+        self.encoder_layer = TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            batch_first=True
+            )
+        self.transformer_encoder = TransformerEncoder(
+            self.encoder_layer,
+            num_layers=n_layers
+            )
+        self.fc = ln_c.Linear(n_output_features*144, n_output_features//2) #256*144, 256
+        self.motion_projection2 = ln_c.Linear(16,n_input_features)
+        self.norm1 = norm_layer(n_input_features//2, n_classes//2)
+        self.dropout_layer = nn.Dropout(p=dropout)
+        if GR: 
+            self.Speaker_Classifier_GR(
+                Channels=[self.n_classes],
+                previous_Channels=self.n_classes,
+                Num_Speakers=2,
+            )
+        self.prediction_head = Speech_Para_Prediction(
+            causal=causal,
+            anticausal=anticausal,
+            compute_db_loudness=compute_db_loudness,
+            n_formants=n_formants,
+            n_formants_noise=n_formants_noise,
+            n_mels=n_mels,
+            network_db=network_db,
+            input_channel=n_output_features,
+        )
+        self.pool = nn.AvgPool1d(kernel_size=2, stride=2)
+        self.conv1 = nn.Conv1d(in_channels=1, out_channels=32, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv1d(in_channels=32, out_channels=256, kernel_size=3, stride=1, padding=1)
+        self.conv3 = nn.ConvTranspose1d(in_channels=256, out_channels=256, kernel_size=4, stride=2, padding=1)
+    def forward(self, inputs, **kwargs):#input size: torch.Size([16, 144, 225])
+        inputs = self.normalize_input_size(inputs)
+        #print(inputs.shape)
+        x = self.embedding(inputs) # Linear Layer torch.Size([16, 144, 256])
+        x = self.pos_encoder(x)
+        x, _ = self.multihead_attn(x, x, x)
+        x = self.transformer_encoder(x)  
+        #print(x.shape) #([16, 144, 256])
+        x = x.view(x.size(0), -1)  #Prepare for fully connected
+        x = F.silu(self.fc(x)) #[16, 128])
+        x = x.unsqueeze(-1).permute(0,2,1) #torch.Size([16, 1, 128])
+        x = F.silu(self.conv1(x)).permute(0,2,1) #[16, 32, 128]
+        x = self.norm1(x)
+        #print(x.shape) # ([16, 128, 32])
+        x = x.permute(0,2,1)
+        #print(x.shape) # ([16, 32, 128])
+        x = self.conv2(self.dropout_layer(x))
+        #print(x.shape) # ([16, 256, 128])
+        latent_representation = self.transformer_encoder(self.conv3(x))
+        #print(latent_representation.shape) ([16, 256, 256])
+        x_common = F.silu(self.pool(latent_representation)) 
+        if self.GR:
+            classified_speakers = self.speaker_classifier_GR(x_common)
+            return classified_speakers
+        #print(x_common.shape)
+        components = self.prediction_head(x_common)
+        return components
 
-# gradient reversal
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=500, dropout=0.5):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]
+        return self.dropout(x)
+
+class NormalizeInputSize(nn.Module):
+    def __init__(self, target_size=(144, 225)):
+        super(NormalizeInputSize, self).__init__()
+        self.target_channels, self.target_length = target_size
+        self.channel_adjust_conv = nn.Conv1d(in_channels=64, out_channels=self.target_channels, kernel_size=1)
+    def forward(self, x):
+        batch_size, channels, length = x.shape
+        if channels != self.target_channels:
+            if channels < self.target_channels:
+                x = self.channel_adjust_conv(x)
+        if length != self.target_length:
+            x = nn.functional.interpolate(x, size=self.target_length, mode='linear', align_corners=False)
+        return x
+    
+#gradient reversal
 class Func(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_, weight):
@@ -2641,7 +2992,6 @@ class Func(torch.autograd.Function):
         ctx.weight = weight
         output = input_
         return output
-
     @staticmethod
     def backward(ctx, grad_output):  # pragma: no cover
         grad_input = None
@@ -2659,7 +3009,6 @@ class GRL(torch.nn.Module):
         """
         super(GRL, self).__init__()
         self.weight = weight
-
     def forward(self, input_):
         return Func.apply(
             input_, torch.FloatTensor([self.weight]).to(device=input_.device)
@@ -2675,14 +3024,12 @@ class Speaker_Classifier_GR(torch.nn.Module):
         Num_Speakers=2,
     ):
         super(Speaker_Classifier_GR, self).__init__()
-
         self.layer = torch.nn.Sequential()
         self.layer.add_module("GRL", GRL(weight=Adversarial_Speaker_Weight))
-
         for index, channels in enumerate(Channels):
             self.layer.add_module(
                 "Hidden_{}".format(index),
-                Conv1d(
+                ln_c.Conv1d(
                     in_channels=previous_Channels,
                     out_channels=channels,
                     kernel_size=1,
@@ -2692,10 +3039,9 @@ class Speaker_Classifier_GR(torch.nn.Module):
             )
             self.layer.add_module("ReLU_{}".format(index), torch.nn.ReLU())
             previous_Channels = channels
-
         self.layer.add_module(
             "Output_{}".format(index),
-            Conv1d(
+            ln_c.Conv1d(
                 in_channels=previous_Channels,
                 out_channels=Num_Speakers,
                 kernel_size=1,
@@ -2703,6 +3049,5 @@ class Speaker_Classifier_GR(torch.nn.Module):
                 w_init_gain="linear",
             ),
         )
-
     def forward(self, x):
         return self.layer(x.unsqueeze(2)).squeeze(2)
