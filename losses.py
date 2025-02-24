@@ -17,9 +17,9 @@ import torch
 import math
 import torch.nn.functional as F
 
-
-__all__ = ['kl', 'reconstruction', 'discriminator_logistic_simple_gp',
-           'discriminator_gradient_penalty', 'generator_logistic_non_saturating']
+__all__ = ['kl', 'reconstruction','critic_loss', 'discriminator_logistic_simple_gp',
+           'discriminator_gradient_penalty', 'generator_logistic_non_saturating',
+           'pl_lengths_reg', 'CosineLoss']
 
 
 def kl(mu, log_var):
@@ -41,7 +41,6 @@ def discriminator_logistic_simple_gp(d_result_real, reals, r1_gamma=10.0):
         loss = r1_penalty * (r1_gamma * 0.5)
     return loss.mean()
 
-
 def discriminator_gradient_penalty(d_result_real, reals, r1_gamma=10.0):
     real_loss = d_result_real.sum()
     real_grads = torch.autograd.grad(real_loss, reals, create_graph=True, retain_graph=True)[0]
@@ -49,10 +48,8 @@ def discriminator_gradient_penalty(d_result_real, reals, r1_gamma=10.0):
     loss = r1_penalty * (r1_gamma * 0.5)
     return loss.mean()
 
-
 def generator_logistic_non_saturating(d_result_fake):
     return F.softplus(-d_result_fake).mean()
-
 
 def pl_lengths_reg(inputs, outputs, mean_path_length, reg_on_gen, temporal_w=False,decay=0.01):
     # e.g. for generator, inputs = w (B x 1 x channel x T(optianal)), outputs=images (B x 1 x T x F)
@@ -79,7 +76,6 @@ def pl_lengths_reg(inputs, outputs, mean_path_length, reg_on_gen, temporal_w=Fal
     path_lengths = path_lengths.mean()
     return path_penalty,path_mean.detach(),path_lengths
 
-
 class CosineLoss(torch.nn.Module):
     r"""Cosine loss.
 
@@ -94,3 +90,20 @@ class CosineLoss(torch.nn.Module):
         outputs = F.normalize(outputs, dim=-1, p=2)
         targets = F.normalize(targets, dim=-1, p=2)
         return (2 - 2 * (outputs * targets).sum(dim=-1)).mean()
+
+
+# 2024 Hedi H. Changed
+#
+# Add New Loss Functions for Speech Decoding
+# ==============================================================================
+
+def spectral_distance_loss(predicted, target):
+    '''For log-Mel spectrogram to compare spectral characteristics'''
+    return F.mse_loss(predicted, target)
+
+def contrastive_loss(output1, output2, label, margin=1.0):
+    '''Contrastive learning of previous and next speech'''
+    euclidean_distance = F.pairwise_distance(output1, output2)
+    loss_contrastive = torch.mean((1 - label) * torch.pow(euclidean_distance, 2) +
+                                    label * torch.pow(torch.clamp(margin - euclidean_distance, min=0.0), 2))
+    return loss_contrastive
